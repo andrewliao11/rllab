@@ -13,6 +13,7 @@ from rllab.misc import logger
 from sandbox.rocky.tf.misc import tensor_utils
 import tensorflow as tf
 
+import pdb
 
 class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
     def __init__(
@@ -31,7 +32,10 @@ class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
             output_nonlinearity=None,
             mean_network=None,
             std_network=None,
-            std_parametrization='exp'
+            std_parametrization='exp',
+            # added arguments
+            w_auxiliary=False,
+            auxliary_classes=0.,
     ):
         """
         :param env_spec:
@@ -69,6 +73,8 @@ class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
                     hidden_sizes=hidden_sizes,
                     hidden_nonlinearity=hidden_nonlinearity,
                     output_nonlinearity=output_nonlinearity,
+                    w_auxiliary=w_auxiliary,
+                    auxliary_classes=auxliary_classes,
                 )
             self._mean_network = mean_network
 
@@ -126,8 +132,19 @@ class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
             self._l_std_param = l_std_param
 
             self._dist = DiagonalGaussian(action_dim)
+            outputs = [l_mean, l_std_param]
+            if w_auxiliary:
+                print('network.py: Using auxiliary model')
+                l_aux_pred = mean_network.aux_layer
+                self._l_aux_pred = l_aux_pred
+                aux_pred_var = self.auxiliary_pred_sym(mean_network.input_layer.input_var, dict())
+                self._f_aux_pred = tensor_utils.compile_function(
+                           inputs=[obs_var],
+                           outputs=aux_pred_var
+                )
+                outputs += [l_aux_pred]
 
-            LayersPowered.__init__(self, [l_mean, l_std_param])
+            LayersPowered.__init__(self, outputs)
             super(GaussianMLPPolicy, self).__init__(env_spec)
 
             dist_info_sym = self.dist_info_sym(mean_network.input_layer.input_var, dict())
@@ -143,6 +160,10 @@ class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
     def vectorized(self):
         return True
 
+    def auxiliary_pred_sym(self, obs_var, state_info_vars=None):
+        aux_pred = L.get_output(self._l_aux_pred, obs_var)
+        return aux_pred
+
     def dist_info_sym(self, obs_var, state_info_vars=None):
         mean_var, std_param_var = L.get_output([self._l_mean, self._l_std_param], obs_var)
         if self.min_std_param is not None:
@@ -154,6 +175,12 @@ class GaussianMLPPolicy(StochasticPolicy, LayersPowered, Serializable):
         else:
             raise NotImplementedError
         return dict(mean=mean_var, log_std=log_std_var)
+
+
+    def get_deterministic_action(self, observation):
+        flat_obs = self.observation_space.flatten(observation)
+        mean, log_std = [x[0] for x in self._f_dist([flat_obs])]
+        return mean, dict(mean=mean, log_std=log_std)
 
     @overrides
     def get_action(self, observation):

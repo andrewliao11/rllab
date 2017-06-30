@@ -1,48 +1,38 @@
+from __future__ import print_function
+from __future__ import absolute_import
+
+
 import gym
-import gym.wrappers
 import gym.envs
 import gym.spaces
-import traceback
-import logging
-
-try:
-    from gym.wrappers.monitoring import logger as monitor_logger
-
-    monitor_logger.setLevel(logging.WARNING)
-except Exception as e:
-    traceback.print_exc()
-
+from gym import wrappers
+#from gym.monitoring import monitor
 import os
 import os.path as osp
 from rllab.envs.base import Env, Step
 from rllab.core.serializable import Serializable
 from rllab.spaces.box import Box
 from rllab.spaces.discrete import Discrete
-from rllab.spaces.product import Product
 from rllab.misc import logger
-
+import logging
+import numpy as np
 
 def convert_gym_space(space):
     if isinstance(space, gym.spaces.Box):
         return Box(low=space.low, high=space.high)
     elif isinstance(space, gym.spaces.Discrete):
         return Discrete(n=space.n)
-    elif isinstance(space, gym.spaces.Tuple):
-        return Product([convert_gym_space(x) for x in space.spaces])
     else:
         raise NotImplementedError
 
 
 class CappedCubicVideoSchedule(object):
-    # Copied from gym, since this method is frequently moved around
     def __call__(self, count):
-        if count < 1000:
-            return int(round(count ** (1. / 3))) ** 3 == count
-        else:
-            return count % 1000 == 0
+        return monitor.capped_cubic_video_schedule(count)
 
 
 class FixedIntervalVideoSchedule(object):
+
     def __init__(self, interval):
         self.interval = interval
 
@@ -56,22 +46,29 @@ class NoVideoSchedule(object):
 
 
 class GymEnv(Env, Serializable):
-    def __init__(self, env_name, record_video=True, video_schedule=None, log_dir=None, record_log=True,
-                 force_reset=False):
-        if log_dir is None:
-            if logger.get_snapshot_dir() is None:
-                logger.log("Warning: skipping Gym environment monitoring since snapshot_dir not configured.")
-            else:
-                log_dir = os.path.join(logger.get_snapshot_dir(), "gym_log")
+    def __init__(self, env_name, record_video=True, video_schedule=None, log_dir=None):
+
+## following lines modified by me (correspondingly commented out below) to suppress the warning messages
+        if log_dir is None and logger.get_snapshot_dir() is not None:
+            log_dir = os.path.join(logger.get_snapshot_dir(), "gym_log")
+
+# *********************
+#        if log_dir is None:
+#            if logger.get_snapshot_dir() is None:
+#                logger.log("Warning: skipping Gym environment monitoring since snapshot_dir not configured.")
+#            else:
+#                log_dir = os.path.join(logger.get_snapshot_dir(), "gym_log")
+# *********************
+
         Serializable.quick_init(self, locals())
 
         env = gym.envs.make(env_name)
         self.env = env
         self.env_id = env.spec.id
 
-        assert not (not record_log and record_video)
+        #monitor.logger.setLevel(logging.CRITICAL)
 
-        if log_dir is None or record_log is False:
+        if log_dir is None:
             self.monitoring = False
         else:
             if not record_video:
@@ -79,16 +76,14 @@ class GymEnv(Env, Serializable):
             else:
                 if video_schedule is None:
                     video_schedule = CappedCubicVideoSchedule()
-            self.env = gym.wrappers.Monitor(self.env, log_dir, video_callable=video_schedule, force=True)
+            self.env.monitor.start(log_dir, video_schedule)
             self.monitoring = True
 
         self._observation_space = convert_gym_space(env.observation_space)
-        logger.log("observation space: {}".format(self._observation_space))
         self._action_space = convert_gym_space(env.action_space)
-        logger.log("action space: {}".format(self._action_space))
-        self._horizon = env.spec.tags['wrapper_config.TimeLimit.max_episode_steps']
+        self._horizon = env.spec.timestep_limit
         self._log_dir = log_dir
-        self._force_reset = force_reset
+        self.injure_idx = None
 
     @property
     def observation_space(self):
@@ -103,24 +98,62 @@ class GymEnv(Env, Serializable):
         return self._horizon
 
     def reset(self):
-        if self._force_reset and self.monitoring:
-            from gym.wrappers.monitoring import Monitor
-            assert isinstance(self.env, Monitor)
-            recorder = self.env.stats_recorder
-            if recorder is not None:
-                recorder.done = True
         return self.env.reset()
 
     def step(self, action):
+        assert len(action.shape) == 1
+        if self.injure_idx is not None:
+            action[self.injure_idx] = 0
         next_obs, reward, done, info = self.env.step(action)
         return Step(next_obs, reward, done, **info)
 
     def render(self):
         self.env.render()
 
+    def set_injure_idx(self, idx):
+        self.injure_idx = idx
+
+    # I have writtin the method evaluate_policy for easy use
+    def evaluate_policy(self, policy, num_episodes=5, horizon=1e6, gamma=1, visual=False,
+        percentile=[], get_full_dist=False):
+        horizon = min(horizon, self._horizon)
+        mean_eval, std, min_eval, max_eval = 0.0, 0.0, -1e8, -1e8
+        ep_returns = np.zeros(num_episodes)
+        for ep in range(num_episodes):
+            o = self.reset()
+            t, done = 0, False
+            while t < horizon and done != True:
+                if visual == True:
+                    self.render()
+                a = policy.get_action(o)[0]
+                o, r, done, _ = self.step(a)
+                ep_returns[ep] += (gamma ** t) * r
+                t += 1
+                #if visual == True and done == True:
+                #    s = self.env.state_vector()
+                #    posafter,height,ang = self.env.model.data.qpos[0:3,0]
+                #    print("Termination reason : \n", np.isfinite(s).all(), (np.abs(s[2:]) < 100).all(), \
+                #        (height > .7), (abs(ang) < .2) )
+        
+        mean_eval, std = np.mean(ep_returns), np.std(ep_returns)
+        min_eval, max_eval = np.amin(ep_returns), np.amax(ep_returns)
+        base_stats = [mean_eval, std, min_eval, max_eval]
+
+        percentile_stats = []
+        full_dist = []
+
+        for p in percentile:
+            percentile_stats.append(np.percentile(ep_returns, p))
+
+        if get_full_dist == True:
+            full_dist = ep_returns
+
+        return [base_stats, percentile_stats, full_dist]
+
+
     def terminate(self):
         if self.monitoring:
-            self.env._close()
+            self.env.monitor.close()
             if self._log_dir is not None:
                 print("""
     ***************************
@@ -131,3 +164,4 @@ class GymEnv(Env, Serializable):
 
     ***************************
                 """ % self._log_dir)
+

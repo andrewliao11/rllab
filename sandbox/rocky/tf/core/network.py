@@ -12,7 +12,10 @@ class MLP(LayersPowered, Serializable):
                  output_nonlinearity, hidden_W_init=L.XavierUniformInitializer(), hidden_b_init=tf.zeros_initializer(),
                  output_W_init=L.XavierUniformInitializer(), output_b_init=tf.zeros_initializer(),
                  input_var=None, input_layer=None, input_shape=None, batch_normalization=False, weight_normalization=False,
+                 # added arguments
+                 w_auxiliary=False, auxliary_classes=0.,
                  ):
+
 
         Serializable.quick_init(self, locals())
 
@@ -38,6 +41,34 @@ class MLP(LayersPowered, Serializable):
                 if batch_normalization:
                     l_hid = L.batch_norm(l_hid)
                 self._layers.append(l_hid)
+            if w_auxiliary:
+                assert auxliary_classes > 0
+                l_hid_aux = L.DenseLayer(
+                    l_hid,
+                    num_units=64,
+                    nonlinearity=hidden_nonlinearity,
+                    name="auxiliary_hidden_0",
+                    W=hidden_W_init,
+                    b=hidden_b_init,
+                    weight_normalization=weight_normalization
+                )
+                if batch_normalization:
+                    l_hid_aux = L.batch_norm(l_hid_aux)
+                self._layers.append(l_hid_aux)
+                l_aux = L.DenseLayer(
+                    l_hid_aux,
+                    num_units=auxliary_classes,
+                    nonlinearity=output_nonlinearity,
+                    name="aux_output",
+                    W=output_W_init,
+                    b=output_b_init,
+                    weight_normalization=weight_normalization
+                )
+                if batch_normalization:
+                    l_aux = L.batch_norm(l_aux)
+                self._layers.append(l_aux)
+                self._l_aux = l_aux
+                
             l_out = L.DenseLayer(
                 l_hid,
                 num_units=output_dim,
@@ -64,6 +95,10 @@ class MLP(LayersPowered, Serializable):
     @property
     def output_layer(self):
         return self._l_out
+
+    @ property
+    def aux_layer(self):
+        return self._l_aux
 
     @property
     def input_var(self):
